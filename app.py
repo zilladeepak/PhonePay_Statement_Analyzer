@@ -1,15 +1,18 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
+import numpy as np
 import re
 from io import BytesIO
 
-# --- Configuration ---
+# --- App configuration ---
+# Configure Streamlit page metadata before rendering any components.
 st.set_page_config(page_title="PhonePe Statement Analyzer", page_icon="📱", layout="wide")
 
 def clean_amount(amount_str):
     """
-    Cleans amount string: removes '₹', commas, and converts to float.
+    Convert an extracted numeric amount string into a float.
+    Removes currency symbols and commas so values can be summed.
     """
     if not amount_str:
         return 0.0
@@ -22,8 +25,8 @@ def clean_amount(amount_str):
 
 def parse_phonepe_pdf(uploaded_file):
     """
-    Extracts transactions from PhonePe PDF using text parsing and Regex
-    instead of table extraction for better reliability.
+    Open the uploaded PDF and extract transaction rows into a DataFrame.
+    This parser uses regex on extracted text lines to identify each transaction.
     """
     data = []
     
@@ -38,12 +41,12 @@ def parse_phonepe_pdf(uploaded_file):
 
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
-            # Extract raw text from the page
+            # Extract raw text from the page and skip pages without text.
             text = page.extract_text()
             if not text:
                 continue
             
-            # Process line by line
+            # Split the page text into lines and match each line against the regex.
             print("Total length of extracted text:", len(text))  # Debugging line
             lines = text.split('\n')
             for line in lines:
@@ -63,10 +66,18 @@ def parse_phonepe_pdf(uploaded_file):
                         "Amount": clean_amount(amount_str)
                     })
 
+    # Build transaction DataFrame and annotate credit/debit/cash flow columns.
     df = pd.DataFrame(data)
+    if not df.empty:
+        df['Credit'] = df.apply(lambda row: row['Amount'] if row['Type'] == 'CREDIT' else 0.0, axis=1)
+        df['Debit'] = df.apply(lambda row: row['Amount'] if row['Type'] == 'DEBIT' else 0.0, axis=1)
+        df['Transaction Cash Flow'] = df['Credit'] - df['Debit']
+        # Cumulative cash flow within each date, shown in the cleaned transaction table.
+        df['Total Cash Flow'] = df.groupby('Date')['Transaction Cash Flow'].transform('cumsum')
     return df
 
 # --- Streamlit UI ---
+# Render the main app title and instructions.
 
 st.title("📱 PhonePe Statement Converter & Analyzer")
 st.markdown("""
@@ -80,7 +91,7 @@ uploaded_file = st.file_uploader("Upload PhonePe PDF Statement", type=["pdf"])
 if uploaded_file is not None:
     with st.spinner("Parsing PDF..."):
         try:
-            # 1. Parse Data
+            # 1. Parse uploaded PDF into a transaction DataFrame.
             df = parse_phonepe_pdf(uploaded_file)
             
             if df.empty:
@@ -89,37 +100,70 @@ if uploaded_file is not None:
                 st.success(f"Successfully extracted {len(df)} transactions.")
 
                 # 2. Data Processing
-                # Convert Date to datetime for sorting
+                # Convert date strings into datetime objects for grouping and sorting.
                 df['Date_Object'] = pd.to_datetime(df['Date'], format='%b %d, %Y', errors='coerce')
                 
-                # Filter for CREDITS only
-                credits_df = df[df['Type'] == 'CREDIT'].copy()
-                
-                # Group by Date and Sum
-                daily_credits = credits_df.groupby('Date_Object')['Amount'].sum().reset_index()
+                # Compute daily totals for credit, debit, and cash flow
+                # This summary is shown in the first tab.
+                daily_summary = df.groupby('Date_Object').agg(
+                    Total_Received=('Credit', 'sum'),
+                    Total_Debits=('Debit', 'sum'),
+                    Total_Cash_Flow=('Transaction Cash Flow', 'sum')
+                ).reset_index()
                 
                 # Format for display
-                daily_credits['Date'] = daily_credits['Date_Object'].dt.strftime('%Y-%m-%d')
-                daily_credits = daily_credits[['Date', 'Amount']].sort_values(by='Date', ascending=False)
-                daily_credits.rename(columns={'Amount': 'Total Received (₹)'}, inplace=True)
+                daily_summary['Date'] = daily_summary['Date_Object'].dt.strftime('%Y-%m-%d')
+                daily_summary = daily_summary[['Date', 'Total_Received', 'Total_Debits', 'Total_Cash_Flow']].sort_values(by='Date', ascending=False)
+                daily_summary.rename(columns={
+                    'Total_Received': 'Total Received (₹)',
+                    'Total_Debits': 'Total Debits (₹)',
+                    'Total_Cash_Flow': 'Total Cash Flow (₹)'
+                }, inplace=True)
 
                 # --- Display Results ---
                 
-                # Metrics
-                total_received = daily_credits['Total Received (₹)'].sum()
+                total_received = daily_summary['Total Received (₹)'].sum()
                 st.metric("Total Money Received (Total Credits)", f"₹ {total_received:,.2f}")
 
                 tab1, tab2 = st.tabs(["📅 Daily Credits Sum", "📋 Cleaned Statement Data"])
 
                 with tab1:
-                    st.subheader("Sum of Credits per Day")
-                    st.dataframe(daily_credits, width='stretch', hide_index=True)
+                    st.subheader("Daily Cash Flow Summary")
+                    st.dataframe(daily_summary, width='stretch', hide_index=True)
 
                 with tab2:
                     st.subheader("All Transactions (Cleaned)")
-                    st.dataframe(df.drop(columns=['Date_Object']), width='stretch', hide_index=True)
+                    
+                    # Insert an empty row between dates for readability.
+                    display_rows = []
+                    prev_date = None
+                    display_df = df.drop(columns=['Date_Object']).copy()
+                    numeric_cols = ['Amount', 'Credit', 'Debit', 'Transaction Cash Flow', 'Total Cash Flow']
+                    for _, row in display_df.iterrows():
+                        if prev_date is not None and row['Date'] != prev_date:
+                            display_rows.append({
+                                col: np.nan if col in numeric_cols else ''
+                                for col in display_df.columns
+                            })
+                        display_rows.append(row.to_dict())
+                        prev_date = row['Date']
+
+                    # Create a DataFrame for display and apply styling to highlight debits in red.
+                    display_df = pd.DataFrame(display_rows)
+                    styled_df = display_df.style.apply(
+                        lambda row: ['color: red' if row['Type'] == 'DEBIT' else '' for _ in row],
+                        axis=1
+                    ).format({
+                        'Amount': '{:.2f}',
+                        'Credit': '{:.2f}',
+                        'Debit': '{:.2f}',
+                        'Transaction Cash Flow': '{:.2f}',
+                        'Total Cash Flow': '{:.2f}'
+                    })
+                    st.dataframe(styled_df, width='stretch', hide_index=True)
 
                 # --- Download Section ---
+                # Provide cleaned transaction downloads in CSV and XLSX formats.
                 st.markdown("---")
                 st.subheader("📥 Download Converted Files")
                 
@@ -138,7 +182,7 @@ if uploaded_file is not None:
                 buffer = BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df.drop(columns=['Date_Object']).to_excel(writer, sheet_name='All Transactions', index=False)
-                    daily_credits.to_excel(writer, sheet_name='Daily Summary', index=False)
+                    daily_summary.to_excel(writer, sheet_name='Daily Summary', index=False)
                 
                 col2.download_button(
                     label="Download as Excel (XLSX)",
